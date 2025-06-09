@@ -1,41 +1,26 @@
-# Esp32-Smart-Thermostat v1.5
-A Wi-Fi-connected smart thermostat built on the ESP32 platform. It features real-time temperature and humidity monitoring (via BME280), PID-based heating control, OLED display output, and a responsive web interface for live data, configuration, and email alerts.
+ESP32 Smart Thermostat V1.5
 
-Features
+A Wi-Fi-connected smart thermostat built on the ESP32 platform. It provides real-time temperature and humidity monitoring, PID-controlled heating, and a full-featured web interface for configuration and alerts.
 
-Real-time monitoring via BME280 (temperature & humidity)
+📷 Overview
 
-PID control (Kp, Ki, Kd adjustable via web GUI)
+Designed for reliability, this thermostat is ideal for greenhouses, reptile enclosures, incubators, and more. It offers OLED display output, live sensor updates, persistent settings, and optional email reporting via Gmail.
 
-OLED display with IP address, status, and alarms
+🔧 Hardware Requirements
 
-Wi-Fi setup with auto-reconnect
+ESP32 Heltec WiFi Kit V3 (or compatible)
 
-Web interface for full configuration
+BME280 Sensor (I2C)
 
-Daily and alarm-based email reports via Gmail SMTP
+SSD1306 OLED Display (128x64, I2C)
 
-JSON API endpoint for integration
+Solid State Relay (SSR) for heating control
 
-Persistent configuration storage with Preferences library
+Internet connection for NTP sync and email features
 
-Hardware Requirements
+💾 Required Libraries
 
-ESP32 board (tested with Heltec WiFi Kit V3)
-
-BME280 temperature and humidity sensor (I2C)
-
-SSD1306 128x64 OLED display (I2C)
-
-Solid State Relay (SSR) for heater control
-
-3.3V power supply and USB cable
-
-Internet access for NTP and email features
-
-Required Libraries
-
-Install the following libraries via the Arduino Library Manager or download from GitHub:
+Install these libraries in Arduino IDE:
 
 WiFi (built-in)
 
@@ -45,113 +30,143 @@ Preferences (built-in)
 
 Wire (built-in)
 
-Adafruit BME280 Library by Adafruit
+Adafruit BME280 and Adafruit Unified Sensor
 
-Adafruit Unified Sensor by Adafruit (dependency for BME280)
+ESPAsyncWebServer → GitHub
 
-ESPAsyncWebServer [https://github.com/me-no-dev/ESPAsyncWebServer]
+AsyncTCP → GitHub
 
-AsyncTCP [https://github.com/me-no-dev/AsyncTCP]
+ESP Mail Client → GitHub
 
-ESP Mail Client [https://github.com/mobizt/ESP-Mail-Client]
+HT_SSD1306Wire.h → (from Heltec ESP32 library)
 
-HT_SSD1306Wire.h from Heltec ESP32 library
+🚀 Installation Instructions
 
-Note: To use ESPAsyncWebServer, install ESPAsyncTCP first. Ensure your board supports ESP32 and you have installed the latest ESP32 board definitions.
+Install Arduino IDE (1.8.19+)
 
-Installation Steps
+Install ESP32 Board Support:
 
-Install Arduino IDE (version 1.8.19 or later recommended)
-
-Install ESP32 board support:
-
-Open Arduino IDE > Preferences
-
-Add this URL to "Additional Board Manager URLs":
+Arduino > Preferences > Additional URLs:
 
 https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 
-Go to Tools > Board > Board Manager > Search "ESP32" and install the latest version.
+Boards Manager → Install "esp32"
 
-Install Required Libraries (see above)
+Install the required libraries (see above)
 
-Connect the hardware:
+Wire the components:
 
-Wire BME280 to pins GPIO47 (SDA) and GPIO48 (SCL)
+BME280 → SDA (GPIO47), SCL (GPIO48)
 
-Wire SSD1306 OLED to same I2C pins (if shared bus)
+OLED → I2C (shared with BME280)
 
-Connect SSR to GPIO1
+SSR → GPIO1
 
-Upload Code:
+Upload the code to your ESP32 via Arduino IDE
 
-Select Heltec WiFi Kit 32 (V3) from Tools > Board
+Access the device via http://esp32.local or the shown IP
 
-Select correct COM port
+🌐 Web Interface
 
-Upload the sketch from Arduino IDE
+Access the thermostat interface:
 
-Initial Setup:
+View live temperature, humidity, and heater status
 
-Connect to the same Wi-Fi network as the ESP32
+Set Wi-Fi credentials, PID parameters, alarm thresholds
 
-Open http://esp32.local or find the IP from the Serial Monitor
+Enable/disable email alerts and schedule daily reports
 
-Configure Wi-Fi, thermostat settings, and email credentials in the web interface
+Send test email and reset settings to defaults
 
-Click Save All Settings (the ESP32 will reboot)
+📨 Email Reporting Setup
 
-Email Setup Notes
+Use a Gmail account with App Passwords enabled
 
-Use Gmail with App Passwords (enable 2FA first)
+Input:
 
-Fill in:
+Sender Email
 
-Sender Email (your Gmail address)
+Gmail App Password
 
-App Password (not the regular password)
+Recipient Email
 
-Recipient Email (any valid address)
+Schedule daily report and enable alarm alerts
 
-Test the email from the web interface
+📡 API Endpoints
 
-Web Interface
+Endpoint
 
-Access UI: http://esp32.local or the device IP (shown on OLED)
+Method
 
-Features:
+Description
 
-View live temperature and humidity
+/
 
-Configure Wi-Fi and PID parameters
+GET
 
-Set alarm thresholds and logging interval
+Main web interface
 
-Configure and test email reporting
+/data
 
-Reset to default settings
+GET
 
-API Endpoints
+JSON with current sensor + status
 
-/data – JSON output with current temperature, humidity, and heater state
+/scan
 
-/scan – Returns Wi-Fi SSID list for dropdown
+GET
 
-/reset – Clears settings and reboots device
+HTML dropdown of nearby Wi-Fi
 
-/testemail – Sends a test email
+/testemail
 
-/debug – Dumps stored settings
+GET
 
-/set – Receives settings from web interface (POST)
+Sends a test email
 
-Licensing
+/reset
 
-MIT License
+GET
 
-Developed By
+Clears settings and reboots device
 
-Gabone (Gabriel M) – June 2025
+/set
 
-For support, feedback, or contributions, please submit an issue or pull request on GitHub.
+POST
+
+Receives settings from web form
+
+/debug
+
+GET
+
+Shows stored config debug info
+
+🕒 Time Zone Setup
+
+The firmware sets the UK time zone with automatic DST:
+
+setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0", 1);
+tzset();
+
+This provides correct local time (GMT or BST) for logs and email reports.
+
+📁 Project Structure
+
+ESP32_Smart_Thermostat/
+├── src/
+│   └── main.ino
+├── README.md
+└── data/
+    └── (if using SPIFFS for assets)
+
+📜 License
+
+This project is licensed under the MIT License. See the LICENSE file for details.
+
+👨‍💻 Author
+
+Developed by Gabone (Gabriel M) – June 2025
+
+Feel free to open an issue or submit a pull request to contribute!
 
