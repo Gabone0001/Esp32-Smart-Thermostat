@@ -1,0 +1,938 @@
+/*
+  ESP32 Smart Thermostat V1.5
+  ---------------------------
+  Wi-Fi-connected thermostat controller based on ESP32, designed for reliable and accurate
+  temperature and humidity monitoring with SSR-based heating control and PID algorithm.
+
+  Key Features:
+  - Real-time monitoring via BME280 (temperature & humidity)
+  - PID-based heater control (Kp, Ki, Kd adjustable via web GUI)
+  - OLED display with status, network info, and alarm indicators
+  - Web interface (ESPAsyncWebServer) for full configuration
+  - Secure Wi-Fi setup with auto-reconnect and live scanning
+  - Daily and test email reports using Gmail SMTP (App Password required)
+  - Persistent configuration via EEPROM (Preferences library)
+  - JSON API for external integration (/data endpoint)
+
+  Hardware Requirements:
+  - ESP32 Heltec WiFi Kit V3 (or similar)
+  - BME280 sensor (I2C)
+  - SSD1306 128x64 OLED display
+  - Solid State Relay (SSR) for heater control
+  - Internet access for NTP time sync and email service
+
+  Developed by: Gabone - (Gabriel M)
+  Version: 1.5
+  Date: June 2025
+  License: MIT (optional)
+
+  Access Web UI at: http://esp32.local or [Device IP]
+*/
+
+// --- Core Networking and System Libraries ---
+#include <WiFi.h>               // ESP32 WiFi functionality
+#include <ESPmDNS.h>            // Multicast DNS for local hostname resolution
+#include <time.h>               // Time functions for NTP synchronization
+#include <Preferences.h>        // Non-volatile storage (replaces EEPROM)
+#include <Wire.h>               // I2C communication
+#include <Adafruit_BME280.h>    // BME280 sensor library
+#include "HT_SSD1306Wire.h"     // OLED display library (Heltec version)
+#include <ESPAsyncWebServer.h>  // Asynchronous web server
+#include <AsyncTCP.h>           // Async TCP support for ESPAsyncWebServer
+#include <ESP_Mail_Client.h>    // Email sending functionality
+
+// Pins & Constants
+#define BME280_ADDRESS 0x76     // I2C address for BME280 sensor
+#define BME_SDA 47              // I2C SDA pin for sensor
+#define BME_SCL 48              // I2C SCL pin for sensor
+#define SSR_PIN 1               // GPIO pin for Solid State Relay control
+#define DISPLAY_UPDATE_INTERVAL 1000  // OLED refresh rate in ms
+#define PID_UPDATE_INTERVAL 1000      // PID calculation interval in ms
+#define WIFI_TIMEOUT 15000      // WiFi connection timeout in ms
+#define INTEGRAL_LIMIT 50.0     // Anti-windup limit for PID integral term
+#define SENSOR_READ_INTERVAL 2000     // Minimum time between sensor reads
+#define MAX_LOG_ENTRIES 1440    // Maximum log entries (1 day at 1-minute intervals)
+#define SMTP_HOST "smtp.gmail.com"    // Gmail SMTP server
+#define SMTP_PORT 465           // Gmail SMTP port (SSL)
+
+// --- WiFi Configuration (default values) ---
+char ssid[32] = "Wifi-Name-Here";        // Default WiFi SSID
+char password[32] = "Password-Here"; // Default WiFi password
+const char device_name[] = "esp32"; // mDNS hostname
+
+// --- Email Configuration ---
+#define SMTP_HOST "smtp.gmail.com"   // SMTP server
+#define SMTP_PORT 465                // SMTP port (SSL)
+
+// --- Thermostat Configuration (Defaults) ---
+struct {
+  float targetTemp = 29.0;       // Desired temperature
+  float tempLowAlarm = 27.0;     // Low temperature alarm threshold
+  bool emailAlarmsEnabled = true;// Enable/disable email alarms
+  float tempHighAlarm = 33.0;    // High temperature alarm threshold
+  float humLowAlarm = 75.0;      // Low humidity alarm threshold
+  float humHighAlarm = 85.0;     // High humidity alarm threshold
+  int emailHour = 16;            // Daily email hour (24h format)
+  int emailMinute = 0;           // Daily email minute
+  int logInterval = 60;          // Logging interval in minutes
+  float kp = 1.50;               // PID proportional constant
+  float ki = 0.02;               // PID integral constant
+  float kd = 0.00;               // PID derivative constant
+  String senderEmail;            // Email sender address
+  String appPassword;            // Email app password
+  String recipientEmail;         // Email recipient address
+} config;
+
+// Sensor data log structure
+struct SensorLog {
+  time_t timestamp;      // Unix timestamp
+  float temperature;     // Temperature reading
+  float humidity;        // Humidity reading
+};
+
+// System state variables
+struct {
+  float integral = 0;            // PID integral term
+  float lastError = 0;           // Previous PID error
+  bool heaterOn = false;         // Heater state
+  bool sensorFault = false;      // Sensor error flag
+  bool wifiConnected = false;    // WiFi connection status
+  unsigned long lastDisplayUpdate = 0; // Last OLED update time
+  unsigned long lastControlTime = 0;   // Last PID calculation time
+  unsigned long lastSensorRead = 0;    // Last sensor read time
+  unsigned long lastDisplaySwitch = 0; // Last display mode switch
+  bool showIP = true;            // Display mode flag (IP vs hostname)
+  float currentTemp = 0;         // Current temperature
+  float currentHum = 0;          // Current humidity
+  SensorLog logEntries[MAX_LOG_ENTRIES]; // Circular buffer for logged data
+  int logIndex = 0;              // Current log position
+  bool logFull = false;          // Log buffer full flag
+} state;
+
+// Global Objects
+TwoWire sensorWire(1);           // I2C bus for sensor
+Adafruit_BME280 bme;             // BME280 sensor object
+Preferences preferences;         // Non-volatile storage
+AsyncWebServer server(80);       // Web server on port 80
+SSD1306Wire display(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RST_OLED); // OLED display
+SMTPSession smtp;                // Email session
+
+// Scans available WiFi networks and returns HTML options
+String scanWiFiNetworks() {
+  int n = WiFi.scanNetworks();
+  String options = "";
+  String currentSSID = WiFi.SSID();
+  
+  for (int i = 0; i < n; ++i) {
+    String ssid = WiFi.SSID(i);
+    options += "<option value='" + ssid + "'";
+    if (ssid == currentSSID) options += " selected";
+    options += ">" + ssid + " (RSSI: " + WiFi.RSSI(i) + ")</option>";
+  }
+  return options;
+}
+
+// Saves all settings to non-volatile storage
+void saveSettings() {
+  preferences.begin("thermo", false); // Open preferences namespace in RW mode
+  preferences.putFloat("kp", config.kp);
+  preferences.putFloat("ki", config.ki);
+  preferences.putFloat("kd", config.kd);
+  preferences.putFloat("targetTemp", config.targetTemp);
+  preferences.putFloat("tempLowAlarm", config.tempLowAlarm);
+  preferences.putFloat("tempHighAlarm", config.tempHighAlarm);
+  preferences.putFloat("humLowAlarm", config.humLowAlarm);
+  preferences.putFloat("humHighAlarm", config.humHighAlarm);
+  preferences.putInt("emailHour", config.emailHour);
+  preferences.putInt("emailMinute", config.emailMinute);
+  preferences.putInt("logInterval", config.logInterval);
+  preferences.putString("senderEmail", config.senderEmail);
+  preferences.putString("appPassword", config.appPassword);
+  preferences.putString("recipientEmail", config.recipientEmail);
+  preferences.putString("ssid", ssid);
+  preferences.putString("pass", password);
+  preferences.putBool("emailAlarms", config.emailAlarmsEnabled);
+  preferences.end();
+}
+
+// Loads settings from non-volatile storage
+void loadSettings() {
+  preferences.begin("thermo", true);
+  config.emailAlarmsEnabled = preferences.getBool("emailAlarms", true);
+  config.targetTemp = preferences.getFloat("targetTemp", 29.0);
+  config.tempLowAlarm = preferences.getFloat("tempLowAlarm", 27.0);
+  config.tempHighAlarm = preferences.getFloat("tempHighAlarm", 33.0);
+  config.humLowAlarm = preferences.getFloat("humLowAlarm", 75.0);
+  config.humHighAlarm = preferences.getFloat("humHighAlarm", 85.0);
+  config.emailHour = preferences.getInt("emailHour", 16);
+  config.emailMinute = preferences.getInt("emailMinute", 0);
+  config.logInterval = preferences.getInt("logInterval", 60);
+  config.kp = preferences.getFloat("kp", 1.50);
+  config.ki = preferences.getFloat("ki", 0.02);
+  config.kd = preferences.getFloat("kd", 0.00);
+  config.senderEmail = preferences.getString("senderEmail", "");
+  config.appPassword = preferences.getString("appPassword", "");
+  config.recipientEmail = preferences.getString("recipientEmail", "");
+  String savedSSID = preferences.getString("ssid", "");
+  String savedPASS = preferences.getString("pass", "");
+  if (savedSSID.length()) strncpy(ssid, savedSSID.c_str(), sizeof(ssid));
+  if (savedPASS.length()) strncpy(password, savedPASS.c_str(), sizeof(password));
+  preferences.end();
+}
+
+// Formats float with 2 decimal places
+String formatFloat(float value) {
+    char buf[10];
+    snprintf(buf, sizeof(buf), "%.2f", value); // Two decimal places
+    return String(buf);
+}
+
+// Formats time as HH:MM:SS
+String formatTime(time_t timestamp) {
+  struct tm* timeinfo = localtime(&timestamp);
+  char buf[20];
+  snprintf(buf, sizeof(buf), "%02d:%02d:%02d", 
+           timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+  return String(buf);
+}
+
+String formatDate(time_t timestamp) {
+  struct tm* timeinfo = localtime(&timestamp);
+  char buf[20];
+  snprintf(buf, sizeof(buf), "%02d/%02d/%04d", 
+           timeinfo->tm_mday, timeinfo->tm_mon + 1, timeinfo->tm_year + 1900);
+  return String(buf);
+}
+
+// Reads sensor data with optional forced read
+bool readSensor(bool force = false) {
+  if (!force && millis() - state.lastSensorRead < SENSOR_READ_INTERVAL) {
+    return !state.sensorFault;
+  }
+  
+  state.currentTemp = bme.readTemperature();
+  state.currentHum = bme.readHumidity();
+  // Handle sensor faults  
+  if (isnan(state.currentTemp) || isnan(state.currentHum)) {
+    state.sensorFault = true;
+    digitalWrite(SSR_PIN, LOW);
+    return false;
+  }
+
+  state.lastSensorRead = millis();
+  
+  // Log data if interval passed
+  static time_t lastLogTime = 0;
+  time_t now = time(nullptr);
+  if (difftime(now, lastLogTime) >= (config.logInterval * 60)) {
+    state.logEntries[state.logIndex] = {now, state.currentTemp, state.currentHum};
+    state.logIndex = (state.logIndex + 1) % MAX_LOG_ENTRIES;
+    if (state.logIndex == 0) state.logFull = true;
+    lastLogTime = now;
+  }
+  
+  state.sensorFault = false;
+  return true;
+}
+
+// PID control algorithm for temperature regulation
+void updatePID() {
+  static float lastError = 0;
+  static float lastDerivative = 0;
+  static unsigned long lastSwitchTime = 0;
+  unsigned long now = millis();
+  
+  // Calculate time step (dt) in seconds with protection
+  float dt = (now - state.lastControlTime) / 1000.0;
+  state.lastControlTime = now;
+  if (dt <= 0 || dt > 10.0) dt = 1.0;  // Handle invalid intervals
+  
+  // Safety check - turn off heater if sensor fails
+  if (state.sensorFault) {
+    digitalWrite(SSR_PIN, LOW);
+    state.heaterOn = false;
+    return;
+  }
+
+  // Calculate current error
+  float error = config.targetTemp - state.currentTemp;
+  
+// PID components
+  float proportional = config.kp * error; // Immediate response
+  state.integral += error * dt;           // Long-term correction
+  state.integral = constrain(state.integral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+  float integral = config.ki * state.integral;
+  float derivative = (dt > 0.001) ? (error - lastError) / dt : 0; // Predictive action
+  derivative = 0.6 * derivative + 0.4 * lastDerivative; // Low-pass filter
+  float derivativeTerm = config.kd * derivative;
+  
+  // Calculate total control signal
+  float control = proportional + integral + derivativeTerm;
+  
+  // Heater control with debounce
+  if (now - lastSwitchTime > 100) {
+    bool newState = (control > 0);
+    if (newState != state.heaterOn) {
+      state.heaterOn = newState;
+      digitalWrite(SSR_PIN, state.heaterOn);
+      lastSwitchTime = now;
+    }
+  }
+
+  // Store values for next iteration
+  lastError = error;
+  lastDerivative = derivative;
+}
+
+// Sends email report (daily or test)
+bool sendEmail(bool isTest = false) {
+  if (config.senderEmail.isEmpty() || config.appPassword.isEmpty() || config.recipientEmail.isEmpty()) {
+    return false;
+  }
+
+  smtp.debug(0);
+  // Configure SMTP session
+  ESP_Mail_Session session;
+  session.server.host_name = SMTP_HOST;
+  session.server.port = SMTP_PORT;
+  session.login.email = config.senderEmail;
+  session.login.password = config.appPassword;
+  session.login.user_domain = "";
+  // Create email message
+  SMTP_Message message;
+  message.sender.name = "ESP32 Thermostat";
+  message.sender.email = config.senderEmail;
+  message.subject = isTest ? "Thermostat Test Email" : "Daily Temperature Report";
+  message.addRecipient("Recipient", config.recipientEmail);
+  // Build email content
+  String htmlContent = "<h2>ESP32 Thermostat Report</h2>";
+  if (isTest) {
+    htmlContent += "<h3>Test Email - Current Readings</h3>";
+    htmlContent += "<p>";
+    htmlContent += formatDate(time(nullptr));
+    htmlContent += " ";
+    htmlContent += formatTime(time(nullptr));
+    htmlContent += " ";
+    htmlContent += "Temp: ";
+    htmlContent += formatFloat(state.currentTemp);
+    htmlContent += "°C ";
+    htmlContent += "Humidity: ";
+    htmlContent += formatFloat(state.currentHum);
+    htmlContent += "%</p>";
+  } else {
+    htmlContent += "<h3>24 Hour Temperature Report</h3>";
+    htmlContent += "<p>Report Time: ";
+    htmlContent += formatDate(time(nullptr));
+    htmlContent += " ";
+    htmlContent += formatTime(time(nullptr));
+    htmlContent += "</p>";
+    htmlContent += "<pre>Date       Time     Temp    Humidity\n";
+    htmlContent += "-------------------------------\n";
+    
+    int startIdx = state.logFull ? state.logIndex : 0;
+    int count = state.logFull ? MAX_LOG_ENTRIES : state.logIndex;
+    
+    for (int i = 0; i < count; i++) {
+      int idx = (startIdx + i) % MAX_LOG_ENTRIES;
+      htmlContent += formatDate(state.logEntries[idx].timestamp);
+      htmlContent += " ";
+      htmlContent += formatTime(state.logEntries[idx].timestamp);
+      htmlContent += " ";
+      htmlContent += formatFloat(state.logEntries[idx].temperature);
+      htmlContent += "°C ";
+      htmlContent += formatFloat(state.logEntries[idx].humidity);
+      htmlContent += "%\n";
+    }
+    htmlContent += "</pre>";
+  }
+
+  message.html.content = htmlContent.c_str();
+  message.text.charSet = "utf-8";
+  message.html.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
+
+  if (!smtp.connect(&session)) {
+    return false;
+  }
+
+  if (!MailClient.sendMail(&smtp, &message)) {
+    return false;
+  }
+
+  return true;
+}
+// Checks if scheduled email should be sent
+void checkScheduledEmail() {
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
+  
+  if (timeinfo->tm_hour == config.emailHour && 
+      timeinfo->tm_min == config.emailMinute && 
+      timeinfo->tm_sec == 0) {
+    sendEmail(false);
+  }
+}
+// Updates OLED display with current status
+void updateDisplay() {
+  if (millis() - state.lastDisplayUpdate < DISPLAY_UPDATE_INTERVAL) return;
+  state.lastDisplayUpdate = millis();
+  
+  display.clear();
+  
+  // Line 1: Date and time
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
+  char line1[32];
+  snprintf(line1, sizeof(line1), "%02d/%02d %02d:%02d",
+           timeinfo->tm_mday, timeinfo->tm_mon + 1,
+           timeinfo->tm_hour, timeinfo->tm_min);
+  display.drawString(0, 0, line1);
+
+  // Line 2: Alternating IP and .local address
+  if (millis() - state.lastDisplaySwitch > 10000) {
+    state.showIP = !state.showIP;
+    state.lastDisplaySwitch = millis();
+  }
+  
+  char line2[32];
+  if (state.showIP) {
+    snprintf(line2, sizeof(line2), "IPv4: %s", WiFi.localIP().toString().c_str());
+  } else {
+    snprintf(line2, sizeof(line2), "%s.local", device_name);
+  }
+  display.drawString(0, 12, line2);
+  
+  // Line 3: Temperature and humidity
+  char line3[32];
+  if (state.sensorFault) {
+    display.drawString(0, 24, "Sensor Error!");
+  } else {
+    snprintf(line3, sizeof(line3), "T:%.1fC H:%.1f%%", state.currentTemp, state.currentHum);
+    display.drawString(0, 24, line3);
+  }
+
+  // Line 4: Heater status and target
+  char line4[32];
+  snprintf(line4, sizeof(line4), "Heat:%s Tgt:%.1fC", 
+           state.heaterOn ? "ON " : "OFF", config.targetTemp);
+  display.drawString(0, 36, line4);
+
+  // Line 5: Alarms if triggered
+  bool tempAlarm = (state.currentTemp < config.tempLowAlarm || 
+                   state.currentTemp > config.tempHighAlarm);
+  bool humAlarm = (state.currentHum < config.humLowAlarm || 
+                   state.currentHum > config.humHighAlarm);
+
+  if (tempAlarm || humAlarm) {
+    // Display alarm message on OLED
+    String alarmText = "ALARM: ";
+    if (tempAlarm) alarmText += "TEMP ";
+    if (humAlarm) alarmText += "HUM";
+    display.drawString(0, 48, alarmText);
+    
+    // Send email alarm if enabled and not too frequent
+    if (config.emailAlarmsEnabled) {
+      static unsigned long lastAlarmEmail = 0;
+      if (millis() - lastAlarmEmail > 3600000) { // 1 hour
+        sendEmail(false);
+        lastAlarmEmail = millis();
+      }
+    }
+  }
+
+  display.display();
+}
+// Generates complete HTML for web interface
+String generateHTML() {
+  String html = "";
+  // HTML Head with CSS and JavaScript
+  html += "<!DOCTYPE html><html><head>";
+  html += "<meta charset='UTF-8'>";
+  html += "<title>ESP32 Smart Thermostat</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>";
+html += "@media (max-width: 500px) {";
+html += "  button.tiny { min-width: 30px; padding: 2px 4px; font-size: 0.75em; }";
+html += "  .password-container { flex-direction: row; gap: 4px; }";
+html += "}";
+  html += "body{font-family:'Segoe UI',Arial,sans-serif;padding:20px;max-width:600px;margin:auto;background:#f5f6fa;color:#2d3436;}";
+  html += "h2{text-align:center;color:#0984e3;margin-top:0;margin-bottom:1em;font-size:1.6em;}";
+  html += "fieldset{background:#fff;border:1px solid #dfe6e9;border-radius:8px;margin:18px 0;padding:18px;box-shadow:0 1px 4px rgba(0,0,0,0.04);}";
+  html += "legend{font-weight:600;font-size:1em;color:#2d3436;padding:0 10px;}";
+  html += "label{display:block;margin:10px 0 5px;font-weight:500;font-size:0.94em;}";
+  html += "input,select{width:100%;padding:8px;border-radius:4px;border:1px solid #ccc;font-size:0.95em;box-sizing:border-box;}";
+  html += "button{padding:7px 14px;border:none;border-radius:4px;font-size:0.9em;cursor:pointer;margin:8px 4px 0 0;}";
+  html += "button:hover{opacity:0.92;}";
+  html += "button.success{background:#00b894;color:#fff;}";
+  html += "button.danger{background:#d63031;color:#fff;}";
+  html += ".status{padding:18px;background:#dfe6e9;border-radius:8px;margin-top:18px;text-align:center;line-height:1.6;}";
+  html += ".value{font-weight:bold;color:#0984e3;}";
+  html += ".help{font-size:0.82em;color:#636e72;margin-top:3px;}";
+  html += ".section-desc{font-style:italic;font-size:0.85em;margin-bottom:12px;color:#636e72;}";
+  html += ".password-container{display:flex;gap:5px;align-items:center;margin-bottom:8px;}";
+  html += ".password-container input{flex:1;min-width:150px;}";
+  html += ".password-container button{padding:3px 8px;font-size:0.85em;min-width:50px;height:34px;background:#b2bec3;color:#2d3436;}";
+  html += ".password-container button:hover{background:#a4b0be;}";
+  html += ".button-group{display:flex;justify-content:center;gap:10px;margin-top:1.5em;}";
+  html += ".inline-group{display:flex;gap:10px;align-items:center;margin:8px 0;}";
+  html += ".inline-group input{flex:1;min-width:80px;}";
+  html += ".pid-table{width:100%;border-collapse:collapse;margin-bottom:10px;}";
+  html += ".pid-table td{padding:5px 6px;vertical-align:middle;}";
+  html += ".unit{white-space:nowrap;width:1%;color:#636e72;font-size:0.9em;}";
+  html += "@media(max-width:500px){input,select,button{width:100%;}.inline-group{flex-direction:column;gap:10px;}}";
+  html += "</style>";
+  
+  // JavaScript
+  html += "<script>";
+  html += "function updateSensorData() {";
+  html += "fetch('/data').then(r=>r.json()).then(data=>{";
+  html += "document.getElementById('currentTemp').innerText=data.temp;";
+  html += "document.getElementById('currentHum').innerText=data.hum;";
+  html += "document.getElementById('heaterStatus').innerText=data.heater;";
+  html += "});}";
+  html += "function updateNetworkList() {";
+  html += "fetch('/scan').then(r=>r.text()).then(t=>{";
+  html += "document.getElementById('ssid').innerHTML=t;";
+  html += "});}";
+  html += "function testEmail() {";
+  html += "if(confirm('Send test email to " + config.recipientEmail + "?')){";
+  html += "fetch('/testemail').then(r=>r.text()).then(alert);";
+  html += "}}";
+  html += "function saveSettings() {";
+  html += "if(!confirm('This will reboot the device. Are you sure you want to save these settings?')) return;";
+  html += "const formData = new FormData(document.getElementById('settingsForm'));";
+  html += "fetch('/set', {method:'POST', body:formData})";
+  html += ".then(r=>r.text()).then(msg=>{alert(msg); setTimeout(()=>{window.location.href='http://" + String(device_name) + ".local';}, 15000);})";
+  html += ".catch(e=>alert('Network error during save. The device is rebooting...'));";
+  html += "}";
+  html += "document.addEventListener('DOMContentLoaded', function() {";
+  html += "updateNetworkList();";
+  html += "updateSensorData();";
+  html += "setInterval(updateSensorData, 1000);";
+  html += "setInterval(updateNetworkList, 30000);";
+  html += "function updateClock() {";
+  html += "const now = new Date();";
+  html += "const timeStr = now.toLocaleTimeString();";
+  html += "const dateStr = now.toLocaleDateString();";
+  html += "document.getElementById('currentTime').innerText = dateStr + ' - ' + timeStr;";
+  html += "}";
+  html += "setInterval(updateClock, 1000);";
+  html += "updateClock();";
+  html += "});";
+  html += "</script>";
+  html += "</head><body>";
+
+  // Status Section
+  html += "<div class='status'>";
+  html += "<h2>ESP32 Smart Thermostat</h2>";
+  html += "<p><strong id='currentTime'></strong></p>";
+  html += "<p>Temperature: <span id='currentTemp' class='value'>" + formatFloat(state.currentTemp) + "</span>°C | ";
+  html += "Humidity: <span id='currentHum' class='value'>" + formatFloat(state.currentHum) + "</span>%</p>";
+  html += "<p><strong>WiFi Status:</strong> " + (state.wifiConnected ? "Connected to " + String(ssid) : "Disconnected") + "</p>";
+  html += "<p><strong>Heater Status:</strong> <span id='heaterStatus' class='value'>" + String(state.heaterOn ? "ON" : "OFF") + "</span> (Target: " + formatFloat(config.targetTemp) + "°C)</p>";
+  html += "<p><strong>PID Settings:</strong> Kp=" + formatFloat(config.kp) + ", Ki=" + formatFloat(config.ki) + ", Kd=" + formatFloat(config.kd) + "</p>";
+  html += "</div>";
+
+  // Settings Form
+  html += "<form id='settingsForm'>";
+
+  // WiFi Configuration Section
+  html += "<fieldset><legend>WiFi Configuration</legend>";
+  html += "<p class='section-desc'>Configure your WiFi network connection settings</p>";
+  html += "<label for='ssid'>WiFi Network:</label>";
+  html += "<select id='ssid' name='ssid'>" + scanWiFiNetworks() + "</select>";
+  html += "<div class='help'>Select your WiFi network from available options</div>";
+  html += "<label for='pass'>WiFi Password:</label>";
+  html += "<div class='password-container'>";
+  html += "<input id='pass' name='pass' type='password' value='" + String(password) + "'>";
+html += "<button type='button' class='tiny' onclick=\"document.getElementById('pass').type=document.getElementById('pass').type=='password'?'text':'password'\">Show</button>";
+//  html += "<button type='button' onclick=\"document.getElementById('pass').type=document.getElementById('pass').type=='password'?'text':'password'\">Show</button>";
+  html += "</div>";
+  html += "<div class='help'>Enter the password for your selected WiFi network</div>";
+  html += "</fieldset>";
+
+  // Thermostat Settings Section
+  html += "<fieldset><legend>Thermostat Settings</legend>";
+  html += "<p class='section-desc'>Configure temperature targets and monitoring settings</p>";
+  html += "<label for='targetTemp'>Target Temperature:</label>";
+  html += "<input id='targetTemp' name='targetTemp' type='number' step='0.1' min='10' max='40' value='" + formatFloat(config.targetTemp) + "'>";
+  html += "<div class='help'>Desired room temperature (10-40°C)</div>";
+  html += "<label for='logInterval'>Logging Interval:</label>";
+  html += "<input id='logInterval' name='logInterval' type='number' min='1' max='120' value='" + String(config.logInterval) + "'>";
+  html += "<div class='help'>How often to store sensor readings (1-120 minutes)</div>";
+      // Temperature Alarms
+      html += "<label>Temperature Alarms:</label>";
+      html += "<table style='width: 100%; margin-bottom: 15px; border-collapse: collapse;'>";
+      html += "<tr>";
+      html += "<td style='width: 50%; padding-right: 10px;'>";
+      html += "<input name='tempLow' type='number' step='0.1' min='-20' max='40' value='" + formatFloat(config.tempLowAlarm) + "' style='width: 100%;'>";
+      html += "<div class='unit'>°C (Low)</div>";
+      html += "</td>";
+      html += "<td style='width: 50%; padding-left: 10px;'>";
+      html += "<input name='tempHigh' type='number' step='0.1' min='30' max='100' value='" + formatFloat(config.tempHighAlarm) + "' style='width: 100%;'>";
+      html += "<div class='unit'>°C (High)</div>";
+      html += "</td>";
+      html += "</tr>";
+      html += "</table>";
+
+      // Humidity Alarms
+      html += "<label>Humidity Alarms:</label>";
+      html += "<table style='width: 100%; margin-bottom: 10px; border-collapse: collapse;'>";
+      html += "<tr>";
+      html += "<td style='width: 50%; padding-right: 10px;'>";
+      html += "<input name='humLow' type='number' step='0.1' min='0' max='80' value='" + formatFloat(config.humLowAlarm) + "' style='width: 100%;'>";
+      html += "<div class='unit'>% (Low)</div>";
+      html += "</td>";
+      html += "<td style='width: 50%; padding-left: 10px;'>";
+      html += "<input name='humHigh' type='number' step='0.1' min='20' max='100' value='" + formatFloat(config.humHighAlarm) + "' style='width: 100%;'>";
+      html += "<div class='unit'>% (High)</div>";
+      html += "</td>";
+      html += "</tr>";
+      html += "</table>";
+
+html += "<div class='help'>Humidity range that triggers alarms (0-100%)</div>";
+html += "</div>";
+  html += "</fieldset>";
+
+  // Email Settings Section
+  html += "<fieldset><legend>Email Reporting</legend>";
+  html += "<p class='section-desc'>Configure automatic email reports and alerts</p>";
+  html += "<label for='sender'>Sender Email:</label>";
+  html += "<input id='sender' name='sender' type='email' value='" + config.senderEmail + "'>";
+  html += "<div class='help'>Your Gmail address (must enable 'Less secure apps')</div>";
+  html += "<label for='app'>App Password:</label>";
+  html += "<div class='password-container'>";
+  html += "<input id='app' name='app' type='password' value='" + config.appPassword + "'>";
+html += "<button type='button' class='tiny' onclick=\"document.getElementById('app').type=document.getElementById('app').type=='password'?'text':'password'\">Show</button>";
+//  html += "<button type='button' onclick=\"document.getElementById('app').type=document.getElementById('app').type=='password'?'text':'password'\">Show</button>";
+  html += "</div>";
+  html += "<div class='help'>Gmail app password (not your account password)</div>";
+  html += "<label for='recipient'>Recipient Email:</label>";
+  html += "<input id='recipient' name='recipient' type='email' value='" + config.recipientEmail + "'>";
+  html += "<div class='help'>Where to send daily reports and alerts</div>";
+  html += "<label for='emailTime'>Daily Report Time:</label>";
+  html += "<div class='inline-group'>";
+  html += "<input id='emailTime' name='emailTime' type='time' value='";
+  if (config.emailHour < 10) html += "0";
+  html += String(config.emailHour) + ":";
+  if (config.emailMinute < 10) html += "0";
+  html += String(config.emailMinute) + "'>";
+  html += "<button type='button' onclick='testEmail()' class='success'>Send Test Email</button>";
+  html += "</div>";
+  html += "<div class='help'>Time to send daily report (24-hour format)</div>";
+  // Alarm e-mail tickbox
+html += "<table style='width: 100%; margin-top: 12px; border-collapse: collapse;'>";
+html += "<tr>";
+html += "<td style='width: 40px; height: 30px; vertical-align: middle; text-align: center;'>";
+html += "<input type='checkbox' id='emailAlarms' name='emailAlarms' style='transform: scale(1.2);' " + 
+        String(config.emailAlarmsEnabled ? "checked" : "") + ">";
+html += "</td>";
+html += "<td style='height: 30px; vertical-align: middle;'>";
+html += "<label for='emailAlarms' style='margin: 0;'>Send email notifications when alarms trigger</label>";
+html += "</td>";
+html += "</tr>";
+html += "</table>";
+  html += "</fieldset>";
+
+  // PID Control Settings Section
+  html += "<fieldset><legend>PID Control Settings</legend>";
+  html += "<p class='section-desc'>Advanced settings for temperature control algorithm</p>";
+  html += "<table class='pid-table'>";
+  html += "<tr><td><label for='kp'>Proportional (Kp):</label></td>";
+  html += "<td><input id='kp' name='kp' type='number' step='0.01' min='0' max='20' value='" + String(config.kp, 2) + "'></td>";
+  html += "<td class='unit'>Range: 0.50-5.00</td></tr>";
+  html += "<tr><td><label for='ki'>Integral (Ki):</label></td>";
+  html += "<td><input id='ki' name='ki' type='number' step='0.01' min='0' max='1' value='" + String(config.ki, 2) + "'></td>";
+  html += "<td class='unit'>Range: 0.01-0.50</td></tr>";
+  html += "<tr><td><label for='kd'>Derivative (Kd):</label></td>";
+  html += "<td><input id='kd' name='kd' type='number' step='0.01' min='0' max='1' value='" + String(config.kd, 2) + "'></td>";
+  html += "<td class='unit'>Range: 0.00-0.20</td></tr>";
+  html += "</table>";
+  html += "<div class='help'>Kp: Reacts to current error (higher = faster response)</div>";
+  html += "<div class='help'>Ki: Corrects steady-state error (higher = faster drift correction)</div>";
+  html += "<div class='help'>Kd: Predicts future error (higher = more damping)</div>";
+  html += "</fieldset>";
+
+  // Action Buttons
+  html += "<div class='button-group'>";
+  html += "<button type='button' onclick='saveSettings()' class='success'>Save All Settings</button>";
+  html += "<button type='button' onclick=\"if(confirm('Reset all settings to defaults?')){fetch('/reset').then(()=>location.reload())}\" class='danger'>Reset to Defaults</button>";
+  html += "</div>";
+
+  html += "</form>";
+  html += "</body></html>";
+  
+  return html;
+}
+// Main setup function
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize OLED display
+  display.init();
+  display.setFont(ArialMT_Plain_10);
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  display.clear();
+  display.drawString(0, 0, "Booting...");
+  display.display();
+
+  // Initialize BME280 sensor
+  sensorWire.begin(BME_SDA, BME_SCL);
+  if (!bme.begin(BME280_ADDRESS, &sensorWire)) {
+    display.clear();
+    display.drawString(0, 0, "BME280 Error!");
+    display.display();
+    while (1);
+  }
+
+  // Connect to WiFi
+  display.drawString(0, 12, "Connecting WiFi...");
+  display.display();
+  
+  WiFi.begin(ssid, password);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT) {
+    delay(250);
+    display.drawString(0, 24, "Attempt " + String((millis()-start)/1000) + "s");
+    display.display();
+  }
+  
+  state.wifiConnected = (WiFi.status() == WL_CONNECTED);
+  if (state.wifiConnected) {
+    MDNS.begin(device_name);
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0", 1);
+    tzset();
+
+    // Wait for time sync
+    time_t now = 0;
+    struct tm timeinfo = {0};
+    int retry = 0;
+    while (timeinfo.tm_year < (2023 - 1900) && retry < 10) {
+      delay(1000);
+      now = time(nullptr);
+      localtime_r(&now, &timeinfo);
+      retry++;
+    }
+
+    if (retry >= 10) {
+      Serial.println("Failed to get NTP time");
+      display.drawString(0, 60, "Time sync failed!");
+    }
+    display.drawString(0, 36, "Connected!");
+    display.drawString(0, 48, WiFi.localIP().toString());
+  } else {
+    display.drawString(0, 36, "WiFi Failed!");
+  }
+  display.display();
+  delay(1000);
+
+  // Initialize SSR pin
+  pinMode(SSR_PIN, OUTPUT);
+  digitalWrite(SSR_PIN, LOW);
+  
+  // Load settings
+  loadSettings();
+
+  // Web server routes
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/html", generateHTML());
+  });
+
+  server.on("/data", HTTP_GET, [](AsyncWebServerRequest *request) {
+    readSensor(true); // Force immediate sensor read
+    String json = "{\"temp\":\"" + String(state.currentTemp, 2) + "\","
+                "\"hum\":\"" + String(state.currentHum, 2) + "\","
+                "\"heater\":\"" + String(state.heaterOn ? "ON" : "OFF") + "\","
+                "\"timestamp\":\"" + String(millis()) + "\"}";
+                
+    AsyncWebServerResponse *response = request->beginResponse(200, "application/json", json);
+    response->addHeader("Access-Control-Allow-Origin", "*");
+    response->addHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    request->send(response);
+  });
+
+  server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/html", scanWiFiNetworks());
+  });
+
+  server.on("/reset", HTTP_GET, [](AsyncWebServerRequest *request) {
+    preferences.begin("thermo", false);
+    preferences.clear();
+    preferences.end();
+    request->send(200, "text/plain", "Settings reset. Rebooting...");
+    delay(1000);
+    ESP.restart();
+  });
+
+  server.on("/testemail", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (sendEmail(true)) {
+      request->send(200, "text/plain", "Test email sent successfully to " + config.recipientEmail);
+    } else {
+      request->send(500, "text/plain", "Failed to send test email. Check settings.");
+    }
+  });
+  
+  server.on("/debug", HTTP_GET, [](AsyncWebServerRequest *request) {
+  preferences.begin("thermo", true);  // Open in read-only mode
+
+  String output = "===== Stored Settings =====\n";
+  output += "Target Temperature: " + String(preferences.getFloat("targetTemp", 0)) + " °C\n";
+  output += "Temperature Alarm Low: " + String(preferences.getFloat("tempLowAlarm", 0)) + " °C\n";
+  output += "Temperature Alarm High: " + String(preferences.getFloat("tempHighAlarm", 0)) + " °C\n";
+  output += "Humidity Alarm Low: " + String(preferences.getFloat("humLowAlarm", 0)) + " %\n";
+  output += "Humidity Alarm High: " + String(preferences.getFloat("humHighAlarm", 0)) + " %\n";
+  output += "Email Report Hour: " + String(preferences.getInt("emailHour", -1)) + "\n";
+  output += "Email Report Minute: " + String(preferences.getInt("emailMinute", -1)) + "\n";
+  output += "Log Interval: " + String(preferences.getInt("logInterval", -1)) + " minutes\n";
+  output += "PID Kp: " + String(preferences.getFloat("kp", 0)) + "\n";
+  output += "PID Ki: " + String(preferences.getFloat("ki", 0)) + "\n";
+  output += "PID Kd: " + String(preferences.getFloat("kd", 0)) + "\n";
+  output += "Sender Email: " + preferences.getString("senderEmail", "not set") + "\n";
+  output += "App Password: " + String((preferences.getString("appPassword", "").length() > 0 ? "[hidden]" : "not set")) + "\n";
+  output += "Saved Password: " + String((preferences.getString("pass", "").length() > 0 ? "[hidden]" : "not set")) + "\n";
+  output += "Recipient Email: " + preferences.getString("recipientEmail", "not set") + "\n";
+  output += "Saved SSID: " + preferences.getString("ssid", "not set") + "\n";
+
+  preferences.end();
+  request->send(200, "text/plain; charset=utf-8", output);
+ });
+
+server.on("/set", HTTP_POST, [](AsyncWebServerRequest *request) {
+    // Debug message
+    Serial.println("Processing /set request");
+    
+    // WiFi Settings
+    if(request->hasParam("ssid", true)) {
+        String newSSID = request->getParam("ssid", true)->value();
+        strlcpy(ssid, newSSID.c_str(), sizeof(ssid));
+        Serial.printf("Set SSID: %s\n", ssid);
+    }
+    
+    if(request->hasParam("pass", true)) {
+        String newPass = request->getParam("pass", true)->value();
+        strlcpy(password, newPass.c_str(), sizeof(password));
+        Serial.printf("Set Password: [hidden]\n");
+    }
+
+    // Thermostat Settings
+    if(request->hasParam("targetTemp", true)) {
+        config.targetTemp = request->getParam("targetTemp", true)->value().toFloat();
+        config.targetTemp = constrain(config.targetTemp, 10.0, 40.0);
+        Serial.printf("Set Target Temp: %.1f°C\n", config.targetTemp);
+    }
+    
+    if(request->hasParam("tempLow", true)) {
+        config.tempLowAlarm = request->getParam("tempLow", true)->value().toFloat();
+        config.tempLowAlarm = constrain(config.tempLowAlarm, -20.0, 40.0);
+        Serial.printf("Set Temp Low Alarm: %.1f°C\n", config.tempLowAlarm);
+    }
+    
+    if(request->hasParam("tempHigh", true)) {
+        config.tempHighAlarm = request->getParam("tempHigh", true)->value().toFloat();
+        config.tempHighAlarm = constrain(config.tempHighAlarm, 30.0, 100.0);
+        Serial.printf("Set Temp High Alarm: %.1f°C\n", config.tempHighAlarm);
+    }
+    
+    if(request->hasParam("humLow", true)) {
+        config.humLowAlarm = request->getParam("humLow", true)->value().toFloat();
+        config.humLowAlarm = constrain(config.humLowAlarm, 0.0, 80.0);
+        Serial.printf("Set Humidity Low Alarm: %.1f%%\n", config.humLowAlarm);
+    }
+    
+    if(request->hasParam("humHigh", true)) {
+        config.humHighAlarm = request->getParam("humHigh", true)->value().toFloat();
+        config.humHighAlarm = constrain(config.humHighAlarm, 20.0, 100.0);
+        Serial.printf("Set Humidity High Alarm: %.1f%%\n", config.humHighAlarm);
+    }
+    
+    if(request->hasParam("logInterval", true)) {
+        config.logInterval = request->getParam("logInterval", true)->value().toInt();
+        config.logInterval = constrain(config.logInterval, 1, 120);
+        Serial.printf("Set Log Interval: %d minutes\n", config.logInterval);
+    }
+
+    // Email Settings
+    if(request->hasParam("emailTime", true)) {
+        String timeStr = request->getParam("emailTime", true)->value();
+        int colonPos = timeStr.indexOf(':');
+        if(colonPos != -1) {
+            config.emailHour = timeStr.substring(0, colonPos).toInt();
+            config.emailMinute = timeStr.substring(colonPos+1).toInt();
+            config.emailHour = constrain(config.emailHour, 0, 23);
+            config.emailMinute = constrain(config.emailMinute, 0, 59);
+            Serial.printf("Set Email Time: %02d:%02d\n", config.emailHour, config.emailMinute);
+        }
+    }
+    
+    if(request->hasParam("sender", true)) {
+        config.senderEmail = request->getParam("sender", true)->value();
+        Serial.printf("Set Sender Email: %s\n", config.senderEmail.c_str());
+    }
+    
+    if(request->hasParam("app", true)) {
+        config.appPassword = request->getParam("app", true)->value();
+        Serial.println("Set App Password: [hidden]");
+    }
+    
+    if(request->hasParam("recipient", true)) {
+        config.recipientEmail = request->getParam("recipient", true)->value();
+        Serial.printf("Set Recipient Email: %s\n", config.recipientEmail.c_str());
+    }
+    if(request->hasParam("emailAlarms", true)) {
+        config.emailAlarmsEnabled = true;
+    } else {
+        config.emailAlarmsEnabled = false;
+    }
+      Serial.printf("Set Email Alarms: %s\n", config.emailAlarmsEnabled ? "Enabled" : "Disabled");
+
+    // PID Settings
+    if(request->hasParam("kp", true)) {
+        config.kp = request->getParam("kp", true)->value().toFloat();
+        config.kp = constrain(config.kp, 0.0, 20.0);
+        Serial.printf("Set Kp: %.2f\n", config.kp);
+    }
+    
+    if(request->hasParam("ki", true)) {
+        config.ki = request->getParam("ki", true)->value().toFloat();
+        config.ki = constrain(config.ki, 0.0, 1.0);
+        Serial.printf("Set Ki: %.2f\n", config.ki);
+    }
+    
+    if(request->hasParam("kd", true)) {
+        config.kd = request->getParam("kd", true)->value().toFloat();
+        config.kd = constrain(config.kd, 0.0, 1.0);
+        Serial.printf("Set Kd: %.2f\n", config.kd);
+    }
+
+    // Save all settings to preferences
+    saveSettings();
+    
+    // Send response and reboot
+    request->send(200, "text/plain", "Settings saved successfully! Rebooting...");
+    Serial.println("Settings saved, rebooting...");
+    delay(1000);
+    ESP.restart();
+});
+
+  server.begin();
+}
+// Main loop
+void loop() {
+    // Read sensor and update PID
+  if (readSensor()) {
+    updatePID();
+  } else {
+    digitalWrite(SSR_PIN, LOW);  // Safety off if sensor fails
+  }
+  // Update display and check for scheduled emails
+  updateDisplay();
+  checkScheduledEmail();
+
+  // Wi-Fi reconnect attempt every 60 seconds if dropped
+  if (!state.wifiConnected && (millis() % 60000 < 1000)) {
+    WiFi.begin(ssid, password);
+    state.wifiConnected = (WiFi.status() == WL_CONNECTED);
+  }
+
+  delay(10);  // Small delay to prevent watchdog triggers
+}
