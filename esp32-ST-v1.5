@@ -1,33 +1,50 @@
 /*
   ESP32 Smart Thermostat V1.5
   ---------------------------
-  Wi-Fi-connected thermostat controller based on ESP32, designed for reliable and accurate
-  temperature and humidity monitoring with SSR-based heating control and PID algorithm.
+  A Wi-Fi-connected smart thermostat controller based on the ESP32 platform,
+  designed for accurate and flexible environmental control using temperature
+  and humidity monitoring via BME280 and PID-regulated heating via SSR.
 
-  Key Features:
-  - Real-time monitoring via BME280 (temperature & humidity)
-  - PID-based heater control (Kp, Ki, Kd adjustable via web GUI)
-  - OLED display with status, network info, and alarm indicators
-  - Web interface (ESPAsyncWebServer) for full configuration
-  - Secure Wi-Fi setup with auto-reconnect and live scanning
-  - Daily and test email reports using Gmail SMTP (App Password required)
-  - Persistent configuration via EEPROM (Preferences library)
-  - JSON API for external integration (/data endpoint)
+  ▓▓ Features:
+  - Real-time environmental monitoring using BME280 (temperature & humidity)
+  - PID-based heater control with adjustable Kp, Ki, Kd via web interface
+  - OLED display showing IP address, system status, alarms, and live readings
+  - Fully responsive Web UI built using ESPAsyncWebServer for configuration
+  - Wi-Fi setup with SSID scanning and persistent credential storage
+  - Auto-reconnect to network after reboot or dropout
+  - Daily email reports and live alarm notifications using Gmail SMTP
+  - Persistent configuration using Preferences (EEPROM replacement)
+  - JSON API available at /data for live sensor values and state
+  - Test email sending and debug output endpoints for diagnostics
 
-  Hardware Requirements:
-  - ESP32 Heltec WiFi Kit V3 (or similar)
+  ▓▓ Use Cases:
+  - Reptile enclosures
+  - Incubators
+  - Greenhouses
+  - Small space environmental monitoring and control
+
+  ▓▓ Hardware Requirements:
+  - ESP32 Heltec WiFi Kit V3 (or similar ESP32 dev board)
   - BME280 sensor (I2C)
-  - SSD1306 128x64 OLED display
+  - SSD1306 128x64 OLED display (I2C)
   - Solid State Relay (SSR) for heater control
-  - Internet access for NTP time sync and email service
+  - Reliable 3.3V power supply
+  - Internet access for NTP and email functions
 
-  Developed by: Gabone - (Gabriel M)
+  ▓▓ Developer Notes:
+  - Project created as a learning experience by a beginner hobbyist.
+  - Tested on Heltec WiFi Kit 32 V3.
+  - Email reporting requires a Gmail App Password.
+  - Timezone is set to UK (GMT/BST) with automatic daylight savings adjustment.
+
+  Developed by: Gabone (Gabriel M)
   Version: 1.5
   Date: June 2025
-  License: MIT (optional)
+  License: MIT
 
-  Access Web UI at: http://esp32.local or [Device IP]
+  Access Web UI at: http://esp32.local or the device's IP (shown on OLED)
 */
+
 
 // --- Core Networking and System Libraries ---
 #include <WiFi.h>               // ESP32 WiFi functionality
